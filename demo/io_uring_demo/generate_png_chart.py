@@ -10,19 +10,18 @@ import sys
 import os
 import math
 
-def run_benchmark():
-    """运行C++测试程序并解析结果"""
+def load_benchmark_data(filename='test_results_64threads.txt'):
+    """从测试结果文件中解析数据"""
     try:
-        print("正在运行5轮性能测试，请稍等...")
-        result = subprocess.run(['./build/test'],
-                              cwd='/home/zys/interfaceIO/demo',
-                              capture_output=True, text=True, timeout=600)
+        print(f"正在读取测试结果文件: {filename}")
 
-        if result.returncode != 0:
-            print(f"测试程序执行失败: {result.stderr}")
+        # 检查文件是否存在
+        if not os.path.exists(filename):
+            print(f"❌ 测试结果文件不存在: {filename}")
             return None
 
-        output = result.stdout
+        with open(filename, 'r', encoding='utf-8') as f:
+            output = f.read()
 
         # 查找JSON数据
         start_marker = "--- BENCHMARK_DATA_START ---"
@@ -32,7 +31,7 @@ def run_benchmark():
         end_idx = output.find(end_marker)
 
         if start_idx == -1 or end_idx == -1:
-            print("未找到基准测试数据")
+            print("❌ 未找到基准测试数据")
             return None
 
         json_data = output[start_idx + len(start_marker):end_idx].strip()
@@ -41,14 +40,12 @@ def run_benchmark():
             data = json.loads(json_data)
             return data['benchmark_results']
         except json.JSONDecodeError as e:
-            print(f"JSON解析失败: {e}")
+            print(f"❌ JSON解析失败: {e}")
+            print(f"原始数据: {json_data[:200]}...")
             return None
 
-    except subprocess.TimeoutExpired:
-        print("测试程序执行超时")
-        return None
     except Exception as e:
-        print(f"执行错误: {e}")
+        print(f"❌ 读取文件错误: {e}")
         return None
 
 def install_pillow():
@@ -280,16 +277,18 @@ def create_png_charts(data, output_file='io_performance_charts.png'):
         return False
 
 def main():
-    print("🎨 PNG图表生成器")
+    print("🎨 PNG图表生成器 - 64线程扩展测试")
     print("=" * 50)
 
-    # 检查是否存在测试程序
-    if not os.path.exists('/home/zys/interfaceIO/demo/build/test'):
-        print("❌ 错误: 测试程序不存在，请先编译")
-        sys.exit(1)
-
-    # 运行基准测试
-    benchmark_data = run_benchmark()
+    # 从共享批量处理的JSON文件加载数据
+    try:
+        with open('benchmark_data_shared_batch.json', 'r') as f:
+            data = json.load(f)
+        benchmark_data = data['benchmark_results']
+        print(f"✅ 成功从JSON文件加载 {len(benchmark_data)} 个测试结果")
+    except Exception as e:
+        print(f"❌ 加载JSON文件失败: {e}")
+        benchmark_data = None
 
     if benchmark_data is None:
         print("❌ 无法获取基准测试数据")
@@ -301,14 +300,18 @@ def main():
 
     print(f"✅ 成功获取 {len(benchmark_data)} 个线程配置的数据，每个配置5组测试")
 
+    # 显示测试范围
+    thread_counts = [item['threads'] for item in benchmark_data]
+    print(f"📊 线程数范围: {min(thread_counts)} - {max(thread_counts)} 线程")
+
     # 生成PNG图表
-    output_file = '/home/zys/interfaceIO/demo/io_performance_comparison.png'
+    output_file = 'io_performance_comparison_shared_batch.png'
     if create_png_charts(benchmark_data, output_file):
         print(f"\n🎉 PNG性能图表生成成功！")
         print(f"📁 文件位置: {output_file}")
         print(f"📊 图表内容:")
-        print(f"   • 上半部分: io_uring vs Normal IO 性能对比曲线")
-        print(f"   • 下半部分: io_uring 加速比柱状图")
+        print(f"   • 上半部分: 共享io_uring批量处理 vs 普通IO 性能对比曲线 (1-64线程)")
+        print(f"   • 下半部分: 共享io_uring批量处理 加速比柱状图")
         print(f"   • 分辨率: 1200x800 像素")
         print(f"   • 格式: PNG，适合插入PPT")
 
@@ -316,6 +319,17 @@ def main():
         if os.path.exists(output_file):
             file_size = os.path.getsize(output_file)
             print(f"📦 文件大小: {file_size/1024:.1f} KB")
+
+        # 显示一些统计信息
+        speedups = [item['speedup'] for item in benchmark_data]
+        avg_speedup = sum(speedups) / len(speedups)
+        max_speedup = max(speedups)
+        max_speedup_threads = thread_counts[speedups.index(max_speedup)]
+
+        print(f"\n📈 性能统计:")
+        print(f"   • 平均加速比: {avg_speedup:.2f}x")
+        print(f"   • 最大加速比: {max_speedup:.2f}x (在{max_speedup_threads}线程时)")
+        print(f"   • 测试范围: {min(thread_counts)}-{max(thread_counts)}线程")
     else:
         print("❌ PNG图表生成失败")
 

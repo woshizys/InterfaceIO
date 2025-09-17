@@ -11,6 +11,10 @@
 #include <numeric>
 #include <cmath>
 #include <tuple>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <memory>
 #include "io_uring_io.h"
 #include "normal_io.h"
 
@@ -70,69 +74,153 @@ private:
         }
     };
 
-    // 正确的io_uring批量测试 - 共享一个io_uring实例，充分利用批量优势
-    TestResult single_test_io_uring(int thread_count, int files_per_thread, size_t file_size, const std::vector<char>& test_data) {
+    // 共享io_uring + 批量处理的正确实现
+    TestResult single_test_io_uring_shared_batch(int thread_count, int files_per_thread, size_t file_size, const std::vector<char>& test_data) {
         TestResult result = {0.0, 0, thread_count * files_per_thread};
 
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // 使用单个io_uring实例进行批量处理
-        IoUringIO io_uring;
-        if (!io_uring.initialize(thread_count * files_per_thread + 64)) {
+        // 共享的io_uring实例
+        IoUringIO shared_io_uring;
+        if (!shared_io_uring.initialize(thread_count * files_per_thread + 64)) {
             return result;
         }
 
-        // 准备所有文件操作
-        std::vector<std::string> filenames;
+        // 任务队列和同步机制
+        struct IOTask {
+            std::string filename;
+            std::shared_ptr<std::promise<ssize_t>> promise;
+        };
+
+        std::queue<IOTask> task_queue;
+        std::mutex queue_mutex;
+        std::condition_variable cv;
+        std::atomic<bool> stop_flag{false};
+        std::atomic<int> completed_tasks{0};
+        std::vector<std::string> all_filenames; // 收集所有文件名，用于计时结束后清理
+        std::mutex filename_mutex;
+
+        // 批量处理线程
+        std::thread batch_processor([&]() {
+            const int BATCH_SIZE = 8; // 批量大小
+
+            while (!stop_flag || !task_queue.empty()) {
+                std::vector<IOTask> batch;
+
+                // 收集一批任务
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    cv.wait_for(lock, std::chrono::milliseconds(1),
+                               [&]() { return !task_queue.empty() || stop_flag; });
+
+                    while (!task_queue.empty() && batch.size() < BATCH_SIZE) {
+                        batch.push_back(std::move(task_queue.front()));
+                        task_queue.pop();
+                    }
+                }
+
+                if (batch.empty()) continue;
+
+                // 批量处理这些任务
+                std::vector<std::string> filenames;
+                for (auto& task : batch) {
+                    filenames.push_back(task.filename);
+                }
+
+                // 使用共享io_uring进行批量写入
+                auto batch_results = shared_io_uring.batch_write_files(filenames, test_data.data(), file_size);
+
+                // 设置结果
+                for (size_t i = 0; i < batch.size() && i < batch_results.size(); i++) {
+                    batch[i].promise->set_value(batch_results[i]);
+                    completed_tasks.fetch_add(1);
+                }
+
+                // 收集文件名，稍后在计时结束后清理
+                {
+                    std::lock_guard<std::mutex> lock(filename_mutex);
+                    all_filenames.insert(all_filenames.end(), filenames.begin(), filenames.end());
+                }
+            }
+        });
+
+        // 多线程提交任务
+        std::vector<std::future<void>> submitters;
         for (int t = 0; t < thread_count; t++) {
-            for (int f = 0; f < files_per_thread; f++) {
-                filenames.push_back("test_uring_t" + std::to_string(t) + "_f" + std::to_string(f) + ".dat");
-            }
+            submitters.push_back(std::async(std::launch::async, [=, &task_queue, &queue_mutex, &cv]() {
+                for (int f = 0; f < files_per_thread; f++) {
+                    std::string filename = "test_shared_batch_t" + std::to_string(t) + "_f" + std::to_string(f) + ".dat";
+                    auto promise = std::make_shared<std::promise<ssize_t>>();
+
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        task_queue.push({std::move(filename), promise});
+                    }
+                    cv.notify_one();
+                }
+            }));
         }
 
-        // 使用真正的批量写入 - 这才是io_uring的正确用法！
-        auto batch_results = io_uring.batch_write_files(filenames, test_data.data(), file_size);
-
-        int success_count = 0;
-        for (ssize_t result_size : batch_results) {
-            if (result_size > 0) {
-                success_count++;
-            }
+        // 等待所有任务提交完成
+        for (auto& submitter : submitters) {
+            submitter.wait();
         }
 
-        result.success_count = success_count;
-
-        // 清理文件
-        for (const auto& filename : filenames) {
-            unlink(filename.c_str());
+        // 等待所有任务处理完成
+        while (completed_tasks.load() < thread_count * files_per_thread) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+
+        stop_flag = true;
+        cv.notify_all();
+        batch_processor.join();
+
+        result.success_count = completed_tasks.load();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
         result.duration_ms = duration.count() / 1000.0;
 
+        // 在计时结束后清理文件
+        for (const auto& filename : all_filenames) {
+            unlink(filename.c_str());
+        }
+
         return result;
     }
 
+    // 普通IO多线程测试
     TestResult single_test_normal_io(int thread_count, int files_per_thread, size_t file_size, const std::vector<char>& test_data) {
         TestResult result = {0.0, 0, thread_count * files_per_thread};
+
+        std::vector<std::string> all_filenames; // 收集所有文件名，用于计时结束后清理
+        std::mutex filename_mutex;
 
         auto start_time = std::chrono::high_resolution_clock::now();
 
         std::vector<std::future<int>> futures;
         for (int t = 0; t < thread_count; t++) {
-            futures.push_back(std::async(std::launch::async, [=, &test_data]() -> int {
+            futures.push_back(std::async(std::launch::async, [=, &test_data, &all_filenames, &filename_mutex]() -> int {
                 NormalIO normal_io;
                 normal_io.initialize();
 
                 int success_count = 0;
+                std::vector<std::string> local_filenames; // 本线程的文件名
+
                 for (int f = 0; f < files_per_thread; f++) {
                     std::string filename = "test_normal_t" + std::to_string(t) + "_f" + std::to_string(f) + ".dat";
                     if (normal_io.write_file(filename, test_data.data(), file_size) > 0) {
                         success_count++;
                     }
-                    unlink(filename.c_str());
+                    local_filenames.push_back(filename); // 收集文件名，不立即删除
                 }
+
+                // 将本线程的文件名添加到全局列表
+                {
+                    std::lock_guard<std::mutex> lock(filename_mutex);
+                    all_filenames.insert(all_filenames.end(), local_filenames.begin(), local_filenames.end());
+                }
+
                 return success_count;
             }));
         }
@@ -145,13 +233,18 @@ private:
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
         result.duration_ms = duration.count() / 1000.0;
 
+        // 在计时结束后清理文件
+        for (const auto& filename : all_filenames) {
+            unlink(filename.c_str());
+        }
+
         return result;
     }
 
 public:
-    // 多次采样的可靠测试
+    // 多次采样的可靠测试 - 对比共享批量处理 vs 普通IO
     void reliable_concurrent_test(int thread_count, int files_per_thread, size_t file_size, int test_rounds = 5) {
-        std::cout << "\n=== 可靠性多线程测试 ===" << std::endl;
+        std::cout << "\n=== 可靠性多线程测试（共享io_uring批量处理 vs 普通IO） ===" << std::endl;
         std::cout << "线程数: " << thread_count
                   << ", 每线程文件数: " << files_per_thread
                   << ", 文件大小: " << file_size / 1024 << "KB"
@@ -161,8 +254,8 @@ public:
 
         auto test_data = generate_test_data(file_size);
 
-        std::vector<double> uring_times, normal_times;
-        std::vector<double> uring_throughputs, normal_throughputs;
+        std::vector<double> uring_shared_times, normal_times;
+        std::vector<double> uring_shared_throughputs, normal_throughputs;
 
         // 多轮测试
         for (int round = 0; round < test_rounds; round++) {
@@ -173,10 +266,10 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
 
-            // io_uring测试
-            auto uring_result = single_test_io_uring(thread_count, files_per_thread, file_size, test_data);
-            uring_times.push_back(uring_result.duration_ms);
-            uring_throughputs.push_back(uring_result.get_throughput());
+            // 共享io_uring批量处理测试
+            auto uring_shared_result = single_test_io_uring_shared_batch(thread_count, files_per_thread, file_size, test_data);
+            uring_shared_times.push_back(uring_shared_result.duration_ms);
+            uring_shared_throughputs.push_back(uring_shared_result.get_throughput());
 
             // 中间休息
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -186,10 +279,10 @@ public:
             normal_times.push_back(normal_result.duration_ms);
             normal_throughputs.push_back(normal_result.get_throughput());
 
-            std::cout << "  io_uring: " << std::fixed << std::setprecision(1)
-                      << uring_result.duration_ms << "ms, "
-                      << uring_result.get_throughput() << " ops/sec" << std::endl;
-            std::cout << "  普通IO:   " << normal_result.duration_ms << "ms, "
+            std::cout << "  共享io_uring批量: " << std::fixed << std::setprecision(1)
+                      << uring_shared_result.duration_ms << "ms, "
+                      << uring_shared_result.get_throughput() << " ops/sec" << std::endl;
+            std::cout << "  普通IO多线程:     " << normal_result.duration_ms << "ms, "
                       << normal_result.get_throughput() << " ops/sec" << std::endl;
         }
 
@@ -213,40 +306,41 @@ public:
             return std::make_tuple(mean, median, stddev);
         };
 
-        auto [uring_mean_time, uring_median_time, uring_stddev_time] = calculate_stats(uring_times);
+        auto [uring_shared_mean_time, uring_shared_median_time, uring_shared_stddev_time] = calculate_stats(uring_shared_times);
         auto [normal_mean_time, normal_median_time, normal_stddev_time] = calculate_stats(normal_times);
-        auto [uring_mean_throughput, uring_median_throughput, uring_stddev_throughput] = calculate_stats(uring_throughputs);
+        auto [uring_shared_mean_throughput, uring_shared_median_throughput, uring_shared_stddev_throughput] = calculate_stats(uring_shared_throughputs);
         auto [normal_mean_throughput, normal_median_throughput, normal_stddev_throughput] = calculate_stats(normal_throughputs);
 
         // 显示统计结果
         std::cout << "\n=== 统计结果 ===" << std::endl;
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "io_uring时间: 平均=" << uring_mean_time << "ms, 中位数=" << uring_median_time
-                  << "ms, 标准差=" << uring_stddev_time << "ms" << std::endl;
+        std::cout << "共享io_uring批量时间: 平均=" << uring_shared_mean_time << "ms, 中位数=" << uring_shared_median_time
+                  << "ms, 标准差=" << uring_shared_stddev_time << "ms" << std::endl;
         std::cout << "普通IO时间:   平均=" << normal_mean_time << "ms, 中位数=" << normal_median_time
                   << "ms, 标准差=" << normal_stddev_time << "ms" << std::endl;
 
         std::cout << std::setprecision(1);
-        std::cout << "io_uring吞吐量: 平均=" << uring_mean_throughput << " ops/sec, 中位数=" << uring_median_throughput << " ops/sec" << std::endl;
-        std::cout << "普通IO吞吐量:   平均=" << normal_mean_throughput << " ops/sec, 中位数=" << normal_median_throughput << " ops/sec" << std::endl;
+        std::cout << "共享io_uring批量吞吐量: 平均=" << uring_shared_mean_throughput << " ops/sec, 中位数=" << uring_shared_median_throughput << " ops/sec" << std::endl;
+        std::cout << "普通IO多线程吞吐量:     平均=" << normal_mean_throughput << " ops/sec, 中位数=" << normal_median_throughput << " ops/sec" << std::endl;
 
         // 性能比较
-        if (normal_mean_time > 0 && uring_mean_time > 0) {
-            double time_speedup = normal_mean_time / uring_mean_time;
-            double throughput_speedup = uring_mean_throughput / normal_mean_throughput;
+        if (normal_mean_time > 0 && uring_shared_mean_time > 0) {
+            double time_speedup = normal_mean_time / uring_shared_mean_time;
+            double throughput_speedup = uring_shared_mean_throughput / normal_mean_throughput;
 
             std::cout << std::setprecision(2);
             std::cout << "平均性能提升: " << time_speedup << "x (基于时间), "
                       << throughput_speedup << "x (基于吞吐量)" << std::endl;
 
             // 结果一致性检查
-            double time_cv = uring_stddev_time / uring_mean_time * 100;
+            double shared_time_cv = uring_shared_stddev_time / uring_shared_mean_time * 100;
             double normal_time_cv = normal_stddev_time / normal_mean_time * 100;
 
-            std::cout << "结果稳定性: io_uring CV=" << std::setprecision(1) << time_cv
-                      << "%, 普通IO CV=" << normal_time_cv << "%" << std::endl;
+            std::cout << "\n=== 结果稳定性 ===" << std::endl;
+            std::cout << "共享io_uring批量 CV=" << std::setprecision(1) << shared_time_cv << "%" << std::endl;
+            std::cout << "普通IO多线程 CV=" << normal_time_cv << "%" << std::endl;
 
-            if (time_cv > 20 || normal_time_cv > 20) {
+            if (shared_time_cv > 20 || normal_time_cv > 20) {
                 std::cout << "⚠️  警告: 结果变异较大，建议增加测试轮数或检查系统负载" << std::endl;
             }
         }
@@ -256,9 +350,9 @@ public:
     void concurrency_sweep_test() {
         std::cout << "\n=== 并发级别扫描测试 ===" << std::endl;
 
-        std::vector<int> thread_counts = {1, 2, 4, 6, 8, 12, 16, 20, 24};
-        const int files_per_thread = 20;
-        const size_t file_size = 16384; // 16KB
+        std::vector<int> thread_counts = {1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64};
+        const int files_per_thread = 30;
+        const size_t file_size = 16 * 1024;
 
         // 输出JSON格式的数据供Python脚本处理
         std::cout << "\n--- BENCHMARK_DATA_START ---" << std::endl;
@@ -266,9 +360,8 @@ public:
 
         bool first = true;
         for (int threads : thread_counts) {
-            if (threads > static_cast<int>(std::thread::hardware_concurrency()) * 2) {
-                continue; // 跳过过高的并发级别
-            }
+            // 移除硬件并发限制，允许测试更高的线程数
+            std::cout << "测试 " << threads << " 线程..." << std::endl;
 
             auto test_data = generate_test_data(file_size);
 
@@ -276,7 +369,7 @@ public:
             std::vector<double> uring_throughputs, normal_throughputs;
 
             for (int round = 0; round < 5; round++) {
-                auto uring_result = single_test_io_uring(threads, files_per_thread, file_size, test_data);
+                auto uring_result = single_test_io_uring_shared_batch(threads, files_per_thread, file_size, test_data);
                 auto normal_result = single_test_normal_io(threads, files_per_thread, file_size, test_data);
 
                 uring_throughputs.push_back(uring_result.get_throughput());
@@ -320,10 +413,6 @@ int main() {
     std::cout << "========================" << std::endl;
 
     ReliableConcurrentTest test;
-
-    // 详细测试几个关键并发级别
-    test.reliable_concurrent_test(8, 20, 16384, 5);  // 8线程，5轮测试
-    test.reliable_concurrent_test(16, 20, 16384, 5); // 16线程，5轮测试
 
     // 并发级别扫描
     test.concurrency_sweep_test();
