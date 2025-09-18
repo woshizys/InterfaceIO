@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 class IoUringIO {
@@ -9,7 +10,7 @@ public:
   ~IoUringIO();
 
   // 初始化io_uring
-  bool initialize(int queue_depth = 256);
+  bool initialize(int queue_depth = 256, bool enable_sqpoll = false);
 
   // 写文件
   ssize_t write_file(const std::string &filename, const char *data,
@@ -19,12 +20,19 @@ public:
   ssize_t read_file(const std::string &filename, char *buffer, size_t size);
 
   // 批量写入文件（io_uring的优势场景）
-  std::vector<ssize_t> batch_write_files(const std::vector<std::string>& filenames,
-                                        const char* data, size_t size);
+  std::vector<ssize_t>
+  batch_write_files(const std::vector<std::string> &filenames, const char *data,
+                    size_t size);
 
   // 批量读取文件
-  std::vector<ssize_t> batch_read_files(const std::vector<std::string>& filenames,
-                                       char* buffer, size_t size);
+  std::vector<ssize_t>
+  batch_read_files(const std::vector<std::string> &filenames, char *buffer,
+                   size_t size);
+
+  // 在同一文件描述符上，按多个偏移批量写入
+  std::vector<ssize_t> batch_write_offsets(int fd, const char *data,
+                                           size_t size,
+                                           const std::vector<off_t> &offsets);
 
   // 写性能测试
   double benchmark_write(const std::string &filename, const char *data,

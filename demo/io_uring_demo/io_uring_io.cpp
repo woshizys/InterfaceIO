@@ -13,6 +13,9 @@ class IoUringIO::Impl {
 public:
   struct io_uring ring;
   bool initialized = false;
+  unsigned queue_depth = 0;
+  unsigned max_inflight = 0;
+  unsigned max_peek = 0;
 
   ~Impl() {
     if (initialized) {
@@ -25,14 +28,55 @@ IoUringIO::IoUringIO() : pImpl(std::make_unique<Impl>()) {}
 
 IoUringIO::~IoUringIO() = default;
 
-bool IoUringIO::initialize(int queue_depth) {
-  int ret = io_uring_queue_init(queue_depth, &pImpl->ring, 0);
+bool IoUringIO::initialize(int queue_depth, bool enable_sqpoll) {
+  struct io_uring_params params;
+  memset(&params, 0, sizeof(params));
+
+  // 组合1：CLAMP + SINGLE_ISSUER (+ 可选 SQPOLL)
+  params.flags = 0;
+  params.flags |= IORING_SETUP_CLAMP;
+  params.flags |= IORING_SETUP_SINGLE_ISSUER;
+  if (enable_sqpoll) {
+    params.flags |= IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = 2000;
+  }
+
+  int ret = io_uring_queue_init_params(queue_depth, &pImpl->ring, &params);
   if (ret < 0) {
-    std::cerr << "io_uring初始化失败: " << strerror(-ret) << std::endl;
-    return false;
+    // 组合2：仅 CLAMP (+ 可选 SQPOLL)
+    memset(&params, 0, sizeof(params));
+    params.flags |= IORING_SETUP_CLAMP;
+    if (enable_sqpoll) {
+      params.flags |= IORING_SETUP_SQPOLL;
+      params.sq_thread_idle = 2000;
+    }
+    ret = io_uring_queue_init_params(queue_depth, &pImpl->ring, &params);
+  }
+  if (ret < 0) {
+    // 最终回退：无 flags
+    ret = io_uring_queue_init(queue_depth, &pImpl->ring, 0);
+    if (ret < 0) {
+      std::cerr << "io_uring初始化失败: " << strerror(-ret) << std::endl;
+      return false;
+    }
   }
 
   pImpl->initialized = true;
+
+  // 记录队列与动态并发参数
+  pImpl->queue_depth = queue_depth;
+  unsigned sq_entries = pImpl->ring.sq.ring_entries; // 实际SQE容量
+  unsigned dyn =
+      sq_entries > 0 ? sq_entries : static_cast<unsigned>(queue_depth);
+  // 建议保留一定冗余，inflight 取实际SQ容量的 ~3/4
+  pImpl->max_inflight = dyn - dyn / 4;
+  if (pImpl->max_inflight < 32)
+    pImpl->max_inflight = std::min(32u, dyn);
+  // 单次批量收割数量
+  pImpl->max_peek = std::min(128u, pImpl->max_inflight);
+  if (pImpl->max_peek == 0)
+    pImpl->max_peek = 64;
+
   return true;
 }
 
@@ -219,8 +263,9 @@ IoUringIO::batch_write_files(const std::vector<std::string> &filenames,
   }
 
   // 使用稳定并发模型：保持 in-flight 的请求数量，批量提交与收割CQE
-  const unsigned MAX_INFLIGHT = 128; // 稳态并发上限，可根据队列深度调整
-  const unsigned MAX_PEEK = 64; // 单次批量收割CQE数量
+  const unsigned MAX_INFLIGHT =
+      (pImpl->max_inflight > 0) ? pImpl->max_inflight : 128;
+  const unsigned MAX_PEEK = (pImpl->max_peek > 0) ? pImpl->max_peek : 64;
 
   size_t total = filenames.size();
   size_t next_to_submit = 0;
@@ -247,22 +292,26 @@ IoUringIO::batch_write_files(const std::vector<std::string> &filenames,
       inflight++;
     }
 
-    // 将已准备的SQE提交到内核
+    // 将已准备的SQE提交到内核（减少提交频率）
     int ret_submit = io_uring_submit(&pImpl->ring);
     if (ret_submit < 0) {
       std::cerr << "提交失败: " << strerror(-ret_submit) << std::endl;
     }
 
     // 批量收割已完成的CQE
-    struct io_uring_cqe *cqes[MAX_PEEK];
-    int got = io_uring_peek_batch_cqe(&pImpl->ring, cqes, MAX_PEEK);
+    std::vector<io_uring_cqe *> cqes;
+    cqes.resize(MAX_PEEK);
+    int got = io_uring_peek_batch_cqe(
+        &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()), MAX_PEEK);
     if (got == 0) {
       // 没有完成，等待至少1个完成，避免忙轮询
       int ret_wait = io_uring_submit_and_wait(&pImpl->ring, 1);
       if (ret_wait < 0) {
         std::cerr << "等待完成失败: " << strerror(-ret_wait) << std::endl;
       }
-      got = io_uring_peek_batch_cqe(&pImpl->ring, cqes, MAX_PEEK);
+      got = io_uring_peek_batch_cqe(
+          &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()),
+          MAX_PEEK);
     }
 
     for (int i = 0; i < got; i++) {
@@ -283,6 +332,84 @@ IoUringIO::batch_write_files(const std::vector<std::string> &filenames,
   for (int fd : fds) {
     if (fd >= 0)
       close(fd);
+  }
+
+  return results;
+}
+
+// 在同一文件描述符上按多个偏移批量写入
+std::vector<ssize_t>
+IoUringIO::batch_write_offsets(int fd, const char *data, size_t size,
+                               const std::vector<off_t> &offsets) {
+  std::vector<ssize_t> results(offsets.size(), -1);
+
+  if (!pImpl->initialized) {
+    std::cerr << "io_uring未初始化" << std::endl;
+    return results;
+  }
+
+  if (fd < 0 || offsets.empty()) {
+    return results;
+  }
+
+  const unsigned MAX_INFLIGHT =
+      (pImpl->max_inflight > 0) ? pImpl->max_inflight : 128;
+  const unsigned MAX_PEEK = (pImpl->max_peek > 0) ? pImpl->max_peek : 64;
+
+  size_t total = offsets.size();
+  size_t next_to_submit = 0;
+  size_t completed = 0;
+  unsigned inflight = 0;
+
+  while (completed < total) {
+    while (inflight < MAX_INFLIGHT && next_to_submit < total) {
+      struct io_uring_sqe *sqe = io_uring_get_sqe(&pImpl->ring);
+      if (!sqe) {
+        int ret_flush = io_uring_submit(&pImpl->ring);
+        if (ret_flush < 0) {
+          std::cerr << "提交失败: " << strerror(-ret_flush) << std::endl;
+          break;
+        }
+        continue;
+      }
+
+      io_uring_prep_write(sqe, fd, data, size, offsets[next_to_submit]);
+      io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(next_to_submit));
+      next_to_submit++;
+      inflight++;
+    }
+
+    int ret_submit = io_uring_submit(&pImpl->ring);
+    if (ret_submit < 0) {
+      std::cerr << "提交失败: " << strerror(-ret_submit) << std::endl;
+    }
+
+    std::vector<io_uring_cqe *> cqes;
+    cqes.resize(MAX_PEEK);
+    int got = io_uring_peek_batch_cqe(
+        &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()), MAX_PEEK);
+    if (got == 0) {
+      int ret_wait = io_uring_submit_and_wait(&pImpl->ring, 1);
+      if (ret_wait < 0) {
+        std::cerr << "等待完成失败: " << strerror(-ret_wait) << std::endl;
+      }
+      got = io_uring_peek_batch_cqe(
+          &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()),
+          MAX_PEEK);
+    }
+
+    for (int i = 0; i < got; i++) {
+      struct io_uring_cqe *cqe = cqes[i];
+      size_t index = reinterpret_cast<size_t>(io_uring_cqe_get_data(cqe));
+      if (index < results.size()) {
+        results[index] = cqe->res;
+      }
+      io_uring_cqe_seen(&pImpl->ring, cqe);
+    }
+    completed += got;
+    if (got > 0 && inflight >= static_cast<unsigned>(got)) {
+      inflight -= static_cast<unsigned>(got);
+    }
   }
 
   return results;
@@ -322,8 +449,9 @@ IoUringIO::batch_read_files(const std::vector<std::string> &filenames,
   }
 
   // 稳态并发读：持续填充SQ并批量收割CQE
-  const unsigned MAX_INFLIGHT = 128;
-  const unsigned MAX_PEEK = 64;
+  const unsigned MAX_INFLIGHT =
+      (pImpl->max_inflight > 0) ? pImpl->max_inflight : 128;
+  const unsigned MAX_PEEK = (pImpl->max_peek > 0) ? pImpl->max_peek : 64;
 
   size_t total = filenames.size();
   size_t next_to_submit = 0;
@@ -354,14 +482,18 @@ IoUringIO::batch_read_files(const std::vector<std::string> &filenames,
       std::cerr << "提交失败: " << strerror(-ret_submit) << std::endl;
     }
 
-    struct io_uring_cqe *cqes[MAX_PEEK];
-    int got = io_uring_peek_batch_cqe(&pImpl->ring, cqes, MAX_PEEK);
+    std::vector<io_uring_cqe *> cqes;
+    cqes.resize(MAX_PEEK);
+    int got = io_uring_peek_batch_cqe(
+        &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()), MAX_PEEK);
     if (got == 0) {
       int ret_wait = io_uring_submit_and_wait(&pImpl->ring, 1);
       if (ret_wait < 0) {
         std::cerr << "等待完成失败: " << strerror(-ret_wait) << std::endl;
       }
-      got = io_uring_peek_batch_cqe(&pImpl->ring, cqes, MAX_PEEK);
+      got = io_uring_peek_batch_cqe(
+          &pImpl->ring, reinterpret_cast<io_uring_cqe **>(cqes.data()),
+          MAX_PEEK);
     }
 
     for (int i = 0; i < got; i++) {

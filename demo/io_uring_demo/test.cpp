@@ -5,14 +5,15 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <fcntl.h> // For open, ftruncate
 #include <future>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <sys/stat.h> // For off_t
 #include <thread>
 #include <tuple>
 #include <unistd.h>
@@ -21,6 +22,10 @@
 // 更可靠的高并发测试
 class ReliableConcurrentTest {
 private:
+  static bool enable_sqpoll() {
+    const char *v = std::getenv("SQPOLL");
+    return v && (*v == '1' || *v == 'y' || *v == 'Y' || *v == 't' || *v == 'T');
+  }
   std::vector<char> generate_test_data(size_t size) {
     std::vector<char> data(size);
     std::random_device rd;
@@ -40,7 +45,7 @@ private:
 
     // 预热io_uring
     IoUringIO io_uring;
-    if (io_uring.initialize(64)) {
+    if (io_uring.initialize(64, enable_sqpoll())) {
       for (int i = 0; i < 10; i++) {
         std::string filename = "warmup_uring_" + std::to_string(i);
         io_uring.write_file(filename, test_data.data(), 4096);
@@ -85,14 +90,14 @@ private:
 
     // 共享的io_uring实例
     IoUringIO shared_io_uring;
-    if (!shared_io_uring.initialize(thread_count * files_per_thread + 64)) {
+    if (!shared_io_uring.initialize(thread_count * files_per_thread + 64,
+                                    enable_sqpoll())) {
       return result;
     }
 
     // 任务队列和同步机制
     struct IOTask {
       std::string filename;
-      std::shared_ptr<std::promise<ssize_t>> promise;
     };
 
     std::queue<IOTask> task_queue;
@@ -104,9 +109,9 @@ private:
         all_filenames; // 收集所有文件名，用于计时结束后清理
     std::mutex filename_mutex;
 
-    // 批量处理线程
-    std::thread batch_processor([&]() {
-      const int BATCH_SIZE = 64; // 批量大小（提高以更好地填满队列）
+    // 批量处理线程（并行多个工作线程以提高提交/收割速率）
+    auto worker_func = [&]() {
+      const int BATCH_SIZE = 128; // 限制批大小，避免FD耗尽
 
       while (!stop_flag || !task_queue.empty()) {
         std::vector<IOTask> batch;
@@ -128,19 +133,17 @@ private:
 
         // 批量处理这些任务
         std::vector<std::string> filenames;
+        filenames.reserve(batch.size());
         for (auto &task : batch) {
-          filenames.push_back(task.filename);
+          filenames.push_back(std::move(task.filename));
         }
 
         // 使用共享io_uring进行批量写入
         auto batch_results = shared_io_uring.batch_write_files(
             filenames, test_data.data(), file_size);
 
-        // 设置结果
-        for (size_t i = 0; i < batch.size() && i < batch_results.size(); i++) {
-          batch[i].promise->set_value(batch_results[i]);
-          completed_tasks.fetch_add(1);
-        }
+        // 统计完成数量（无论成功失败都计为处理完成，避免等待卡死）
+        completed_tasks.fetch_add(static_cast<int>(batch_results.size()));
 
         // 收集文件名，稍后在计时结束后清理
         {
@@ -149,7 +152,14 @@ private:
                                filenames.end());
         }
       }
-    });
+    };
+
+    unsigned workers = 2; // 控制提交/收割并发，避免同时打开过多文件
+    std::vector<std::thread> processors;
+    processors.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) {
+      processors.emplace_back(worker_func);
+    }
 
     // 多线程提交任务
     std::vector<std::future<void>> submitters;
@@ -159,11 +169,9 @@ private:
             for (int f = 0; f < files_per_thread; f++) {
               std::string filename = "test_shared_batch_t" + std::to_string(t) +
                                      "_f" + std::to_string(f) + ".dat";
-              auto promise = std::make_shared<std::promise<ssize_t>>();
-
               {
                 std::lock_guard<std::mutex> lock(queue_mutex);
-                task_queue.push({std::move(filename), promise});
+                task_queue.push({std::move(filename)});
               }
               cv.notify_one();
             }
@@ -175,14 +183,26 @@ private:
       submitter.wait();
     }
 
-    // 等待所有任务处理完成
-    while (completed_tasks.load() < thread_count * files_per_thread) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // 等待所有任务处理完成（增加超时防护避免极端情况下卡死）
+    {
+      using namespace std::chrono;
+      const auto deadline = steady_clock::now() + seconds(120);
+      const int target = thread_count * files_per_thread;
+      while (completed_tasks.load() < target &&
+             steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      // 若超时未完成，发出停止信号，消费残留队列
+      if (completed_tasks.load() < target) {
+        stop_flag = true;
+        cv.notify_all();
+      }
     }
 
     stop_flag = true;
     cv.notify_all();
-    batch_processor.join();
+    for (auto &th : processors)
+      th.join();
 
     result.success_count = completed_tasks.load();
 
@@ -257,6 +277,121 @@ private:
       unlink(filename.c_str());
     }
 
+    return result;
+  }
+
+  // 新增：基于单大文件的分区写测试
+  TestResult single_file_offset_benchmark(int thread_count, int ops_per_thread,
+                                          size_t block_size,
+                                          const std::vector<char> &block) {
+    TestResult result = {0.0, 0, thread_count * ops_per_thread};
+
+    // 预创建单大文件并扩展容量
+    const char *fname = "offset_bench.dat";
+    int fd = open(fname, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+      std::cerr << "创建测试文件失败" << std::endl;
+      return result;
+    }
+    off_t total_len =
+        static_cast<off_t>(thread_count) * ops_per_thread * block_size;
+    if (ftruncate(fd, total_len) != 0) {
+      std::cerr << "扩展文件失败" << std::endl;
+      close(fd);
+      return result;
+    }
+
+    // 生成所有 offsets（每线程独占区间，避免冲突）
+    std::vector<off_t> offsets;
+    offsets.reserve(result.total_count);
+    for (int t = 0; t < thread_count; ++t) {
+      off_t base = static_cast<off_t>(t) * ops_per_thread * block_size;
+      for (int i = 0; i < ops_per_thread; ++i) {
+        offsets.push_back(base + static_cast<off_t>(i) * block_size);
+      }
+    }
+
+    IoUringIO uring;
+    if (!uring.initialize(thread_count * ops_per_thread + 64,
+                          enable_sqpoll())) {
+      std::cerr << "io_uring 初始化失败" << std::endl;
+      close(fd);
+      return result;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // 按 offsets 批量写入
+    auto res = uring.batch_write_offsets(fd, block.data(), block_size, offsets);
+
+    // 统计成功数
+    int ok = 0;
+    for (auto r : res)
+      if (r == static_cast<ssize_t>(block_size))
+        ok++;
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto dur =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    result.duration_ms = dur.count() / 1000.0;
+    result.success_count = ok;
+
+    // 清理
+    close(fd);
+    unlink(fname);
+    return result;
+  }
+
+  // 新增：普通IO基线 - 单大文件分区写（多线程 pwrite）
+  TestResult
+  normal_single_file_offset_benchmark(int thread_count, int ops_per_thread,
+                                      size_t block_size,
+                                      const std::vector<char> &block) {
+    TestResult result = {0.0, 0, thread_count * ops_per_thread};
+
+    const char *fname = "offset_bench_normal.dat";
+    int fd = open(fname, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) {
+      std::cerr << "创建测试文件失败" << std::endl;
+      return result;
+    }
+    off_t total_len =
+        static_cast<off_t>(thread_count) * ops_per_thread * block_size;
+    if (ftruncate(fd, total_len) != 0) {
+      std::cerr << "扩展文件失败" << std::endl;
+      close(fd);
+      return result;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(thread_count));
+    for (int t = 0; t < thread_count; ++t) {
+      threads.emplace_back([&, t]() {
+        off_t base = static_cast<off_t>(t) * ops_per_thread * block_size;
+        for (int i = 0; i < ops_per_thread; ++i) {
+          off_t off = base + static_cast<off_t>(i) * block_size;
+          ssize_t w = pwrite(fd, block.data(), block_size, off);
+          if (w == static_cast<ssize_t>(block_size))
+            ok.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    for (auto &th : threads)
+      th.join();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto dur =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    result.duration_ms = dur.count() / 1000.0;
+    result.success_count = ok.load();
+
+    close(fd);
+    unlink(fname);
     return result;
   }
 
@@ -387,13 +522,13 @@ public:
     }
   }
 
-  // 扫描不同并发级别并输出JSON格式数据
+  // 扫描不同并发级别并输出JSON格式数据（原始对比：共享io_uring批量 vs 普通IO）
   void concurrency_sweep_test() {
     std::cout << "\n=== 并发级别扫描测试 ===" << std::endl;
 
     std::vector<int> thread_counts = {1,  2,  4,  6,  8,  12, 16,
                                       20, 24, 32, 40, 48, 56, 64};
-    const int files_per_thread = 30;
+    const int files_per_thread = 10;
     const size_t file_size = 16 * 1024;
 
     // 输出JSON格式的数据供Python脚本处理
@@ -403,8 +538,6 @@ public:
     bool first = true;
     for (int threads : thread_counts) {
       // 移除硬件并发限制，允许测试更高的线程数
-      std::cout << "测试 " << threads << " 线程..." << std::endl;
-
       auto test_data = generate_test_data(file_size);
 
       // 进行5轮测试获取详细数据
@@ -458,6 +591,67 @@ public:
     std::cout << std::endl << "]}" << std::endl;
     std::cout << "--- BENCHMARK_DATA_END ---" << std::endl;
   }
+
+  // 保留：偏移分区扫描作为附加基准（不默认执行）
+  void offsets_sweep_test() {
+    std::cout << "\n=== 并发级别扫描测试（单文件分区写） ===" << std::endl;
+
+    std::vector<int> thread_counts = {1, 2, 4, 8, 12, 16, 24, 32};
+    const int ops_per_thread = 200; // 每线程操作数
+    const size_t block_size = 64 * 1024;
+
+    std::cout << "\n--- BENCHMARK_DATA_START ---" << std::endl;
+    std::cout << "{\"offset_benchmark\": [" << std::endl;
+
+    bool first = true;
+    for (int threads : thread_counts) {
+      auto block = generate_test_data(block_size);
+      std::vector<double> uring_throughputs, normal_throughputs;
+      for (int round = 0; round < 3; ++round) {
+        auto uring_res = single_file_offset_benchmark(threads, ops_per_thread,
+                                                      block_size, block);
+        auto normal_res = normal_single_file_offset_benchmark(
+            threads, ops_per_thread, block_size, block);
+        uring_throughputs.push_back(uring_res.get_throughput());
+        normal_throughputs.push_back(normal_res.get_throughput());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+
+      double avg_uring = std::accumulate(uring_throughputs.begin(),
+                                         uring_throughputs.end(), 0.0) /
+                         uring_throughputs.size();
+      double avg_normal = std::accumulate(normal_throughputs.begin(),
+                                          normal_throughputs.end(), 0.0) /
+                          normal_throughputs.size();
+      double speedup = (avg_normal > 0) ? (avg_uring / avg_normal) : 0.0;
+
+      if (!first)
+        std::cout << "," << std::endl;
+      std::cout << "  {\"threads\": " << threads << ",\n";
+      std::cout << "   \"io_uring_samples\": [";
+      for (size_t i = 0; i < uring_throughputs.size(); ++i) {
+        if (i > 0)
+          std::cout << ", ";
+        std::cout << std::fixed << std::setprecision(1) << uring_throughputs[i];
+      }
+      std::cout << "],\n";
+      std::cout << "   \"normal_io_samples\": [";
+      for (size_t i = 0; i < normal_throughputs.size(); ++i) {
+        if (i > 0)
+          std::cout << ", ";
+        std::cout << std::fixed << std::setprecision(1)
+                  << normal_throughputs[i];
+      }
+      std::cout << "],\n";
+      std::cout << "   \"io_uring_avg\": " << avg_uring << ",\n";
+      std::cout << "   \"normal_io_avg\": " << avg_normal << ",\n";
+      std::cout << "   \"speedup\": " << std::setprecision(3) << speedup << "}";
+      first = false;
+    }
+
+    std::cout << std::endl << "]}" << std::endl;
+    std::cout << "--- BENCHMARK_DATA_END ---" << std::endl;
+  }
 };
 
 int main() {
@@ -467,7 +661,8 @@ int main() {
   ReliableConcurrentTest test;
 
   // 并发级别扫描
-  test.concurrency_sweep_test();
+  // test.concurrency_sweep_test();
+  test.offsets_sweep_test();
 
   return 0;
 }
